@@ -86,6 +86,14 @@ class SerialGUI:
     RX_PUMP_INTERVAL_MS = 20
     # Chunks drained per pump, so one burst cannot monopolise the event loop.
     RX_PUMP_BUDGET = 200
+    # Reader thread pacing. After a read of at least this many bytes the link
+    # is busy (the RP2040's native USB delivers hundreds of kB/s), so the
+    # reader goes straight back for more instead of sleeping. Below it - any
+    # 115200-baud board - it sleeps 10 ms between reads exactly as before.
+    RX_BUSY_BYTES = 512
+    # Driver receive buffer to ask for. Windows defaults to 4 KB, which a fast
+    # USB link fills between two reads.
+    RX_DRIVER_BUFFER = 1 << 20
     # Legend placement, negative offset anchors it to the top right.
     LEGEND_OFFSET = (-70, 30)
 
@@ -1135,6 +1143,15 @@ class SerialGUI:
                 stopbits=stop_bits,
                 timeout=0.1
             )
+            # Windows only (pyserial has no such call elsewhere): a bigger
+            # driver buffer so a fast USB board is not throttled between
+            # reads. Best effort - the driver may round or ignore it.
+            if hasattr(self.serial_connection, "set_buffer_size"):
+                try:
+                    self.serial_connection.set_buffer_size(
+                        rx_size=self.RX_DRIVER_BUFFER)
+                except Exception:
+                    pass
             
             # Clear data if option is enabled
             if self.clear_on_connect.get():
@@ -1239,6 +1256,8 @@ class SerialGUI:
                     data = conn.read(pending)
                     if data:
                         self._post_rx(('data', data))
+                    if pending >= self.RX_BUSY_BYTES:
+                        continue  # more is surely waiting; don't sleep
                 time.sleep(0.01)  # Small delay to prevent excessive CPU usage
             except serial.SerialException:
                 self._post_rx(('error', None))

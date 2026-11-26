@@ -270,6 +270,53 @@ cam.mode_var.set("2048x1536")
 app.write_bytes = real_write
 
 
+print("\n-- preview keeps up with a fast link --")
+# The RP2040 Adalogger streams preview frames faster than any GUI can decode
+# and draw them. Simulate a burst of 60 frames arriving at once, as wire-sized
+# chunks through the real receive queue, with the pump running.
+import time as _time
+cam.mode_var.set("320x240")
+cam.pix_fmt_var.set("RGB565")     # preview is JPEG whatever the still format
+strip_before = list(cam.captures)
+cam._streaming = True
+cam._preview_frame = cam._preview_latest = None
+cam._preview_scores = []
+cam._preview_rx = cam._preview_shown = 0
+frames = [cam.make_test_pattern(0x03, arducam.PIX_FMT_JPEG) for _ in range(2)]
+# Tag each frame so the newest one is recognisable: bytes after FF D9 are
+# ignored by a JPEG decoder.
+burst = b"".join(arducam.pack_preview_packet(arducam.PIX_FMT_JPEG,
+                                             frames[0] + i.to_bytes(4, "big"))
+                 for i in range(60))
+for offset in range(0, len(burst), 16384):
+    app._post_rx(("data", burst[offset:offset + 16384]))
+pump(3)
+check(app._rx_queue.empty(), "a 60-frame burst is drained from the queue at once")
+check(cam._preview_rx == 60, f"every frame is parsed ({cam._preview_rx}/60)")
+pump(12)
+check(0 < cam._preview_shown < 60,
+      f"but only the newest are drawn ({cam._preview_shown} of 60)")
+check(cam.current is not None and cam.current.data[-4:] == (59).to_bytes(4, "big"),
+      "the frame on screen is the newest one")
+check(cam.current.image is not None and cam.current.pix_fmt == arducam.PIX_FMT_JPEG,
+      "decoded as JPEG even though the still format is RGB565")
+check(cam.captures == strip_before,
+      "preview frames do not flood the capture strip")
+check(cam._preview_scores, "each drawn frame feeds the live sharpness bars")
+
+# Stopping: the firmware's bare trailer then the streamoff packet.
+cam.consume(arducam.pack_stream_off())
+pump(2)
+check(not cam._streaming and cam._preview_timer is None,
+      "streamoff ends preview and cancels the pending draw")
+check(len(cam.captures) == min(len(strip_before) + 1, camera_mod.MAX_CAPTURES)
+      and cam.captures[-1].data[-4:] == (59).to_bytes(4, "big"),
+      "and the last frame joins the strip, so it can be saved")
+check(cam.current is cam.captures[-1], "and stays on screen")
+cam.pix_fmt_var.set("JPEG")
+cam.mode_var.set("2048x1536")
+
+
 print("\n-- watchdog --")
 cam._reset_transfer()
 cam._busy = True

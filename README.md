@@ -134,8 +134,13 @@ The size list is built from the module's own reported capabilities, so a 3MP cam
 never offered a resolution it cannot produce. "Camera Info" shows the module, its exposure
 and gain limits, and the firmware and SDK versions.
 
-**Preview** streams frames continuously for framing and coarse focus. At 115200 that is
-roughly one frame a second, so it is not smooth video; keep it at 320x240 or 640x480.
+**Preview** streams frames continuously for framing and focus. On the Thing Plus (115200)
+that is roughly one frame a second; on the RP2040 Adalogger, whose Lab 5 firmware sends over
+native USB, it is several. Either way keep it at 320x240 or 640x480. The viewer always shows
+the newest frame and skips any that arrive faster than it can draw them (at most about ten a
+second), so the picture never lags behind the camera. Zoom, pan and the ruler stay put while
+it updates, and the sharpness bars show the last few seconds of frames, so you can turn the
+lens and watch the bars climb. Only the last frame is kept in the strip when preview stops.
 
 **Looking at the image.** "Fit" shows the whole frame; "1:1" shows one image pixel per
 screen pixel, and `-`/`+` or the mouse wheel step the zoom. Drag to pan. Click two points
@@ -292,8 +297,8 @@ not match `kestrelsat.__version__`.
    battery.
 8. **A capture takes half a minute**: That is expected at full resolution. See
    [Why captures are slow](#why-captures-are-slow).
-9. **Preview is not smooth**: Also expected - roughly one frame a second at 115200. Use it
-   for framing and coarse focus, not as video.
+9. **Preview is not smooth**: Expected on the Thing Plus - roughly one frame a second at
+   115200. Use it for framing and coarse focus, not as video.
 10. **"image arrived without its end marker"**: The image is shown anyway but may be
     truncated. Usually a baud-rate or cabling problem; retake it.
 
