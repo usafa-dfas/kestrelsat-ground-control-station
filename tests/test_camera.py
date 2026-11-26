@@ -304,9 +304,15 @@ check(cam.captures == strip_before,
       "preview frames do not flood the capture strip")
 check(cam._preview_scores, "each drawn frame feeds the live sharpness bars")
 
-# Stopping: the firmware's bare trailer then the streamoff packet.
+# Stopping. The firmware sends preview a few hundred bytes at a time between
+# command checks, so Stop usually lands mid-frame: half a frame, then the bare
+# trailer and the streamoff packet. That used to leave the tab "busy" forever.
+cam.consume(arducam.pack_preview_packet(arducam.PIX_FMT_JPEG, frames[0])[:3000])
 cam.consume(arducam.pack_stream_off())
 pump(2)
+check(not cam.busy, "a stop that lands mid-frame does not leave the tab busy")
+check(str(cam.take_btn["state"]) == "normal" and str(cam.preview_btn["state"]) == "normal",
+      "and Take Picture and Start Preview are usable again")
 check(not cam._streaming and cam._preview_timer is None,
       "streamoff ends preview and cancels the pending draw")
 check(len(cam.captures) == min(len(strip_before) + 1, camera_mod.MAX_CAPTURES)
@@ -315,6 +321,22 @@ check(len(cam.captures) == min(len(strip_before) + 1, camera_mod.MAX_CAPTURES)
 check(cam.current is cam.captures[-1], "and stays on screen")
 cam.pix_fmt_var.set("JPEG")
 cam.mode_var.set("2048x1536")
+
+# If the MCU never confirms the stop, the tab gives up after a few seconds
+# rather than staying busy.
+real_write = app.write_bytes
+app.write_bytes = lambda payload: None
+cam._streaming = True
+cam.parser.watch_stream_off = True
+cam.consume(arducam.pack_preview_packet(arducam.PIX_FMT_JPEG, frames[0])[:3000])
+cam.toggle_preview()                       # sends stop; no reply will come
+pump(2)
+check(cam._streaming, "Stop Preview waits for the camera's reply at first")
+cam._stop_requested_at -= camera_mod.STREAM_STOP_TIMEOUT + 1
+cam._check_watchdog()
+check(not cam.busy and not cam.parser.in_image,
+      "but with no reply it stops anyway and drops the half-read frame")
+app.write_bytes = real_write
 
 
 print("\n-- watchdog --")

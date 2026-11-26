@@ -35,6 +35,12 @@ quirks in Arducam's firmware that this parser absorbs rather than trips over:
     text payload's length is a hint, and the trailer is what really ends it.
   * stop_preivew() writes a bare 0xFF 0xBB to close the frame it interrupted
     before sending its 0x06 packet, so a trailer can arrive while idle.
+    Preview sends a frame a few hundred bytes at a time between command
+    checks, so a stop nearly always lands mid-frame: the image's declared
+    length is never reached, and a parser that trusted it would read the
+    streamoff packet as image data and then wait forever. With
+    watch_stream_off set, the parser spots that sequence inside an image
+    body, drops the partial frame and goes on to read the streamoff packet.
   * The image header's format byte means different things in the two paths
     that emit it: stills pack the resolution mode into the high nibble, the
     preview callback packs the pixel format there. It is therefore reported
@@ -147,6 +153,12 @@ MAX_IMAGE_BYTES = 8 << 20
 MAX_TEXT_BYTES = 4096
 # How far past a declared length to look for the trailer before giving up.
 TRAILER_SCAN = 64
+# What stop_preivew() writes: a bare trailer, then the start of the 0x06
+# streamoff packet. FF BB and FF AA never occur
+# inside a JPEG (an FF in JPEG data is always followed by 00, a restart
+# marker D0-D7 or the end marker D9), so this cannot be mistaken for image
+# bytes - but raw RGB565/YUV can hold anything, hence the opt-in flag.
+STREAM_OFF_SIGNATURE = b"\xff\xbb\xff\xaa\x06"
 
 # Bytes per second on the wire: 115200 8N1 is 10 bits/byte, and the firmware's
 # arducamUartWrite adds delayUs(12) on top of every one of them.
@@ -310,6 +322,14 @@ class StreamMarker:
     """A bare 0xFF 0xBB seen while idle - stop_preivew() closing a frame."""
 
 
+@dataclass
+class AbortedImage:
+    """A preview frame cut short by stop_preivew(), discarded unfinished."""
+
+    received: int = 0
+    declared_len: int = 0
+
+
 # Parser states.
 _IDLE = 0
 _BODY = 1
@@ -335,6 +355,8 @@ class PacketParser:
         self._body = bytearray()
         self._need = 0
         self._absorb_extra = False
+        # Set while preview runs; see the module docstring.
+        self.watch_stream_off = False
         self.reset()
 
     # -- state ---------------------------------------------------------------
@@ -385,6 +407,8 @@ class PacketParser:
                 if not self._scan_idle(packets, residual):
                     break
             elif self._state == _BODY:
+                if self.watch_stream_off and self._cut_by_stream_off(packets):
+                    continue
                 if not self._read_body():
                     break
             else:
@@ -453,8 +477,60 @@ class PacketParser:
         limit = self.max_image_bytes if ptype == PKT_IMAGE else MAX_TEXT_BYTES
         return declared <= limit
 
+    def _cut_by_stream_off(self, packets) -> bool:
+        """True if a stop interrupted the image now being read.
+
+        Looks for STREAM_OFF_SIGNATURE starting inside what is left of the
+        declared body. One that starts at or after the declared end is the
+        normal case - the frame finished first - and is left for the trailer
+        and idle states to handle. The search covers the last few body bytes
+        too, in case the signature straddles two reads.
+        """
+        pkt = self._pkt
+        if pkt is None or not pkt.is_image:
+            return False
+        sig = STREAM_OFF_SIGNATURE
+        tail = bytes(self._body[-(len(sig) - 1):])
+        window = tail + bytes(self._buf[:self._need + len(sig)])
+        found = window.find(sig)
+        if found < 0 or found - len(tail) >= self._need:
+            return False
+        # Keep everything from the streamoff packet's FF AA onwards; the
+        # partial frame and the bare FF BB that closed it are discarded.
+        start_in_buf = found - len(tail) + 2
+        if start_in_buf >= 0:
+            del self._buf[:start_in_buf]
+        else:                         # the FF BB itself was already in the body
+            self._buf[:0] = window[found + 2:len(tail)]
+        packets.append(AbortedImage(received=len(self._body), declared_len=pkt.declared_len))
+        self._pkt = None
+        self._body = bytearray()
+        self._need = 0
+        self._state = _IDLE
+        return True
+
+    def _hold_back_partial_stop(self, take: int) -> int:
+        """Don't finish an image body on what may be the start of a stop.
+
+        If the bytes available end with the first few bytes of
+        STREAM_OFF_SIGNATURE, and those start inside the body, the rest of the
+        signature may be in the next read. Finishing the body now would bury
+        it, so take only the bytes before it and wait for more.
+        """
+        sig = STREAM_OFF_SIGNATURE
+        tail = bytes(self._body[-(len(sig) - 1):])
+        window = tail + bytes(self._buf)
+        body_end = len(tail) + self._need
+        for start in range(max(0, len(window) - len(sig) + 1), body_end):
+            if sig.startswith(window[start:]):
+                return max(0, start - len(tail))
+        return take
+
     def _read_body(self) -> bool:
         take = min(self._need, len(self._buf))
+        if (take == self._need and self.watch_stream_off
+                and self._pkt is not None and self._pkt.is_image):
+            take = self._hold_back_partial_stop(take)
         if take:
             self._body += self._buf[:take]
             del self._buf[:take]

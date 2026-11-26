@@ -167,6 +167,45 @@ check(sum(1 for p in pkts if getattr(p, "is_image", False)) == 1,
       "preview frame then stop: the frame is delivered")
 check(res == b"", "preview stop sequence leaves no residue")
 
+# Stop Preview mid-frame. The firmware sends preview a few hundred bytes at a
+# time between command checks, so a stop usually cuts a frame short: the
+# declared length is never reached, and stop_preivew() writes FF BB plus the
+# streamoff packet where the rest of the image should have been.
+frame = arducam.pack_preview_packet(arducam.PIX_FMT_JPEG, JPEG)
+header_len = 8
+still = arducam.pack_image_packet(0x03, arducam.PIX_FMT_JPEG, JPEG)
+cut_ok = True
+for cut in (header_len, header_len + 1, header_len + 200, len(frame) - 4,
+            len(frame) - 3):
+    for chunk in (None, 1, 2, 3, 5, 7, 64, 200):
+        seq = frame[:cut] + arducam.pack_stream_off() + still
+        parser = arducam.PacketParser()
+        parser.watch_stream_off = True
+        pkts, res = parse_all(seq, chunk, parser)
+        kinds = [type(p).__name__ if not hasattr(p, "type") else p.type for p in pkts]
+        images = [p for p in pkts if getattr(p, "is_image", False)]
+        if not (any(isinstance(p, arducam.AbortedImage) for p in pkts)
+                and arducam.PKT_STREAM_OFF in kinds
+                and len(images) == 1 and images[0].payload == JPEG
+                and res == b""):
+            cut_ok = False
+            print(f"    cut={cut} chunk={chunk}: {kinds} res={res[:20]!r}")
+check(cut_ok, "a stop mid-frame: the partial frame is dropped, streamoff is "
+              "parsed, and the next still arrives intact (every cut and split)")
+
+parser = arducam.PacketParser()           # the old behaviour, for contrast
+pkts, res = parse_all(frame[:header_len + 200] + arducam.pack_stream_off(), None, parser)
+check(not any(getattr(p, "type", None) == arducam.PKT_STREAM_OFF for p in pkts),
+      "without watch_stream_off the streamoff is swallowed as image data")
+
+parser = arducam.PacketParser()
+parser.watch_stream_off = True
+pkts, res = parse_all(frame + arducam.pack_stream_off(), 3, parser)
+check(sum(1 for p in pkts if getattr(p, "is_image", False)) == 1
+      and not any(isinstance(p, arducam.AbortedImage) for p in pkts)
+      and any(getattr(p, "type", None) == arducam.PKT_STREAM_OFF for p in pkts),
+      "a stop just after a complete frame still delivers that frame")
+
 
 print("\n-- interleaved telemetry (the demux contract) --")
 TELEM = b"TIME:1.0,SENSOR_A:12.5\r\n"

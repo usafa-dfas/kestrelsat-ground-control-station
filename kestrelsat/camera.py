@@ -66,6 +66,7 @@ CAMERA_BAUD = 115200          # the firmware hard-codes this
 COMMAND_GAP_MS = 25           # the MCU flushes anything arriving in one burst
 RESOLUTION_SETTLE_MS = 500    # set-resolution also fires an untransmitted shot
 STREAM_STOP_MS = 300
+STREAM_STOP_TIMEOUT = 3.0     # seconds to wait for "streamoff" before giving up
 TICK_MS = 100                 # progress repaint + watchdog
 FIRST_BYTE_TIMEOUT = 8.0      # seconds to wait for any response at all
 STALL_TIMEOUT = 5.0           # seconds without progress mid-image
@@ -147,6 +148,7 @@ class CameraTab:
         self._preview_rx = 0              # frames received this preview
         self._preview_shown = 0           # frames actually drawn
         self._fps_mark = (0.0, 0, 0)      # (time, rx, shown) at the last readout
+        self._stop_requested_at = 0.0     # when Stop Preview was sent
 
         # Viewer state, in image coordinates.
         self._photo = None
@@ -439,6 +441,14 @@ class CameraTab:
     def _on_packet(self, packet):
         if isinstance(packet, arducam.StreamMarker):
             return
+        if isinstance(packet, arducam.AbortedImage):
+            # Stop Preview landed mid-frame; the streamoff packet follows.
+            if self.trace_var.get():
+                self.app.log_message(
+                    f"Camera: preview frame cut short by stop at "
+                    f"{packet.received:,} of {packet.declared_len:,} bytes",
+                    "SYSTEM")
+            return
         if self.trace_var.get():
             self.app.log_message(
                 f"Camera: packet type={packet.type:#04x} len={packet.declared_len} "
@@ -461,7 +471,9 @@ class CameraTab:
             self.info["sdk"] = packet.payload.hex()
         elif packet.type == arducam.PKT_STREAM_OFF:
             self._end_preview()
+            self._reset_transfer()
             self.preview_btn.configure(text="Start Preview")
+            self._set_controls_enabled(self.app.is_connected)
             self.status_var.set("Preview stopped. The last frame is kept in the strip.")
         else:
             text = packet.text
@@ -562,6 +574,8 @@ class CameraTab:
         """Leave preview mode, keeping the last frame as an ordinary capture."""
         was_streaming = self._streaming
         self._streaming = False
+        self._stop_requested_at = 0.0
+        self.parser.watch_stream_off = False
         if self._preview_timer is not None:
             try:
                 self.app.root.after_cancel(self._preview_timer)
@@ -1077,8 +1091,7 @@ class CameraTab:
 
     def toggle_preview(self):
         if self._streaming:
-            self._queue(arducam.stop_stream(), gap_ms=STREAM_STOP_MS)
-            self.status_var.set("Stopping preview...")
+            self._request_stop()
             return
         if not self._ready("starting preview"):
             return
@@ -1096,9 +1109,21 @@ class CameraTab:
         self._preview_scores = []
         self._preview_rx = self._preview_shown = 0
         self._fps_mark = (0.0, 0, 0)
+        self._stop_requested_at = 0.0
+        # Let the parser recognise a stop that lands mid-frame (arducam.py).
+        self.parser.watch_stream_off = True
         self.preview_btn.configure(text="Stop Preview")
         self.status_var.set("Preview running.")
         self._queue(arducam.set_video_resolution(mode))
+
+    def _request_stop(self):
+        """Ask the MCU to stop streaming. Preview ends when its "streamoff"
+        packet arrives (_on_packet), or after STREAM_STOP_TIMEOUT regardless,
+        so a lost reply can never leave the tab stuck as busy."""
+        self._queue(arducam.stop_stream(), gap_ms=STREAM_STOP_MS)
+        if not self._stop_requested_at:
+            self._stop_requested_at = time.monotonic()
+        self.status_var.set("Stopping preview...")
 
     def cancel_capture(self):
         """Give up on the image, but keep reading it.
@@ -1109,7 +1134,7 @@ class CameraTab:
         packet is consumed to its end and discarded.
         """
         if self._streaming:
-            self._queue(arducam.stop_stream(), gap_ms=STREAM_STOP_MS)
+            self._request_stop()
             return
         if not self._busy:
             return
@@ -1187,6 +1212,19 @@ class CameraTab:
 
     def _check_watchdog(self):
         """Fail a capture that has stopped arriving rather than hanging."""
+        if (self._streaming and self._stop_requested_at
+                and time.monotonic() - self._stop_requested_at > STREAM_STOP_TIMEOUT):
+            # The MCU never confirmed. Stop listening for preview anyway, and
+            # drop any half-read frame so the next capture starts clean.
+            self.parser.reset()
+            self._end_preview()
+            self._reset_transfer()
+            self.preview_btn.configure(text="Start Preview")
+            self.status_var.set("Preview stopped (the camera did not confirm).")
+            self.app.log_message(
+                "Camera: no 'streamoff' reply to Stop Preview; stopped anyway", "ERROR")
+            self._set_controls_enabled(self.app.is_connected)
+            return
         if not self._busy or self._cancelling:
             return
         now = time.monotonic()

@@ -44,6 +44,17 @@ preview readings while it runs. Preview always decodes as JPEG, which is what th
 streams, whatever the still format is set to. Frames reach the viewer as raw PPM instead of
 PNG, about four times cheaper, which also speeds up redraws after zooming and panning.
 
+**Stop Preview no longer leaves the tab stuck.** The firmware sends each preview frame a
+few hundred bytes at a time between command checks, so Stop usually lands mid-frame, and
+`stop_preivew()` sends its end marker and "streamoff" reply where the rest of the image
+should have been. The parser trusted the frame's declared length, read the reply as image
+data, and waited forever for the remainder. That left preview "running" and every later
+Take Picture or Start Preview refused with "wait for the current capture to finish".
+While preview runs, the parser now recognises that sequence inside a frame (it cannot
+occur in JPEG data), drops the partial frame and reads the reply. As a backstop, if no
+reply arrives within 3 seconds of Stop, the tab stops anyway and clears the half-read
+frame.
+
 The reader thread no longer sleeps between reads while the link is busy (a read of 512
 bytes or more), and on Windows asks for a 1 MB driver receive buffer instead of the 4 KB
 default. A 115200 board never fills 512 bytes in one 10 ms poll, so it is read exactly as
