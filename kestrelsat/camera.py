@@ -66,6 +66,7 @@ CAMERA_BAUD = 115200          # the firmware hard-codes this
 COMMAND_GAP_MS = 25           # the MCU flushes anything arriving in one burst
 RESOLUTION_SETTLE_MS = 500    # set-resolution also fires an untransmitted shot
 STREAM_STOP_MS = 300
+STREAM_STOP_TIMEOUT = 3.0     # seconds to wait for "streamoff" before giving up
 TICK_MS = 100                 # progress repaint + watchdog
 FIRST_BYTE_TIMEOUT = 8.0      # seconds to wait for any response at all
 STALL_TIMEOUT = 5.0           # seconds without progress mid-image
@@ -74,6 +75,14 @@ THUMB_PX = 64
 FOCUS_ROI = 512               # sharpness is always measured over this many
                               # native pixels, so readings stay comparable
 ZOOM_STEPS = (0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+# Preview pacing. On a fast link (the RP2040's native USB) frames can arrive
+# faster than the GUI can decode and draw them, and drawing every one would
+# back up the receive queue until the picture lagged seconds behind the camera.
+# So preview shows only the newest frame, and no more often than this - or
+# twice as long as the last frame took to draw, whichever is longer - which
+# always leaves the GUI at least half its time for everything else.
+PREVIEW_MIN_INTERVAL_MS = 100
+PREVIEW_HISTORY = 40          # preview sharpness readings kept for the bars
 
 
 @dataclass
@@ -127,6 +136,19 @@ class CameraTab:
         self._progress_dirty = False
         self._capture_started = 0.0
         self._decoder_ready = None
+
+        # Preview state. _preview_latest holds the newest frame not yet shown;
+        # a frame that arrives before it is drawn simply replaces it.
+        self._preview_latest = None
+        self._preview_frame: Optional[Capture] = None
+        self._preview_timer = None
+        self._preview_scores: List[float] = []
+        self._preview_cost = 0.0          # seconds the last frame took to show
+        self._preview_shown_at = 0.0
+        self._preview_rx = 0              # frames received this preview
+        self._preview_shown = 0           # frames actually drawn
+        self._fps_mark = (0.0, 0, 0)      # (time, rx, shown) at the last readout
+        self._stop_requested_at = 0.0     # when Stop Preview was sent
 
         # Viewer state, in image coordinates.
         self._photo = None
@@ -258,9 +280,11 @@ class CameraTab:
                                       command=self.toggle_preview)
         self.preview_btn.pack(fill=tk.X, pady=(px(2), 0))
         ToolTip(self.preview_btn,
-                "Preview streams JPEG frames over the same 115200 link, so it "
-                "runs at roughly one frame a second. Useful for framing and "
-                "coarse focus, not smooth video.")
+                "Preview streams JPEG frames continuously for framing and "
+                "focus. On the Thing Plus (115200 link) that is about one frame "
+                "a second; on the RP2040 Adalogger it is several. The newest "
+                "frame is always shown, and frames that arrive faster than "
+                "they can be drawn are skipped.")
         self.info_btn = ttk.Button(cap, text="Camera Info", command=self.show_info)
         self.info_btn.pack(fill=tk.X, pady=(px(2), 0))
 
@@ -360,7 +384,7 @@ class CameraTab:
         self._cancel_timers(commands=True)
         self.parser.reset()
         self._reset_transfer()
-        self._streaming = False
+        self._end_preview()
         self.preview_btn.configure(text="Start Preview")
         self.update_banner()
         self._set_controls_enabled(False)
@@ -417,6 +441,14 @@ class CameraTab:
     def _on_packet(self, packet):
         if isinstance(packet, arducam.StreamMarker):
             return
+        if isinstance(packet, arducam.AbortedImage):
+            # Stop Preview landed mid-frame; the streamoff packet follows.
+            if self.trace_var.get():
+                self.app.log_message(
+                    f"Camera: preview frame cut short by stop at "
+                    f"{packet.received:,} of {packet.declared_len:,} bytes",
+                    "SYSTEM")
+            return
         if self.trace_var.get():
             self.app.log_message(
                 f"Camera: packet type={packet.type:#04x} len={packet.declared_len} "
@@ -438,15 +470,20 @@ class CameraTab:
         elif packet.type == arducam.PKT_SDK_VERSION:
             self.info["sdk"] = packet.payload.hex()
         elif packet.type == arducam.PKT_STREAM_OFF:
-            self._streaming = False
+            self._end_preview()
+            self._reset_transfer()
             self.preview_btn.configure(text="Start Preview")
-            self.status_var.set("Preview stopped.")
+            self._set_controls_enabled(self.app.is_connected)
+            self.status_var.set("Preview stopped. The last frame is kept in the strip.")
         else:
             text = packet.text
             if text:
                 self.app.log_message(f"Camera: {text}", "SYSTEM")
 
     def _on_image(self, packet):
+        if self._streaming:
+            self._on_preview_frame(packet)
+            return
         self._reset_transfer()
         if self._cancelling:
             self._cancelling = False
@@ -454,24 +491,7 @@ class CameraTab:
             self._set_controls_enabled(self.app.is_connected)
             return
 
-        pix_fmt = self._selected_pix_fmt()
-        mode = self._selected_mode()
-        # The format byte is not trustworthy (stills and preview pack different
-        # things into it), but a JPEG always starts FF D8, so that much can be
-        # checked.
-        if pix_fmt == arducam.PIX_FMT_JPEG and not packet.looks_like_jpeg():
-            self.app.log_message(
-                "Camera: expected JPEG but the payload has no SOI marker", "ERROR")
-        width, height = arducam.size_for_mode(mode)
-        capture = Capture(data=packet.payload, pix_fmt=pix_fmt, mode=mode,
-                          width=width, height=height,
-                          distance=self.distance_var.get().strip(),
-                          trailer_ok=packet.trailer_ok)
-        if not packet.trailer_ok:
-            self.app.log_message(
-                "Camera: image arrived without its end marker - it may be "
-                "truncated", "ERROR")
-
+        capture = self._capture_from(packet, self._selected_pix_fmt())
         elapsed = time.monotonic() - self._capture_started if self._capture_started else 0
         self.add_capture(capture)
         if not self._streaming:
@@ -480,6 +500,130 @@ class CameraTab:
             self._set_controls_enabled(self.app.is_connected)
         if self.autosave_var.get():
             self.save_image(auto=True)
+
+    def _capture_from(self, packet, pix_fmt: int) -> Capture:
+        """Wrap a received image packet as a Capture (not yet decoded)."""
+        mode = self._selected_mode()
+        # The format byte is not trustworthy (stills and preview pack different
+        # things into it), but a JPEG always starts FF D8, so that much can be
+        # checked.
+        if pix_fmt == arducam.PIX_FMT_JPEG and not packet.looks_like_jpeg():
+            self.app.log_message(
+                "Camera: expected JPEG but the payload has no SOI marker", "ERROR")
+        if not packet.trailer_ok:
+            self.app.log_message(
+                "Camera: image arrived without its end marker - it may be "
+                "truncated", "ERROR")
+        width, height = arducam.size_for_mode(mode)
+        return Capture(data=packet.payload, pix_fmt=pix_fmt, mode=mode,
+                       width=width, height=height,
+                       distance=self.distance_var.get().strip(),
+                       trailer_ok=packet.trailer_ok)
+
+    # -- preview -------------------------------------------------------------
+
+    def _on_preview_frame(self, packet):
+        """A preview frame arrived. Hold it, and draw it when the GUI is free.
+
+        Nothing is decoded here: this runs inside the receive pump, and the pump
+        must get straight back to draining the serial port. If another frame
+        arrives before this one is drawn, it replaces it - the old one is
+        already out of date.
+        """
+        self._preview_rx += 1
+        self._last_rx = time.monotonic()
+        self._preview_latest = packet
+        if self._preview_timer is None:
+            interval = max(PREVIEW_MIN_INTERVAL_MS / 1000.0, 2 * self._preview_cost)
+            wait = interval - (time.monotonic() - self._preview_shown_at)
+            self._preview_timer = self.app.root.after(
+                max(1, int(wait * 1000)), self._show_preview)
+
+    def _show_preview(self):
+        """Decode, score and draw the newest preview frame."""
+        self._preview_timer = None
+        packet, self._preview_latest = self._preview_latest, None
+        if packet is None or self._destroyed:
+            return
+        started = time.monotonic()
+        # Preview always streams JPEG, whatever the still format is set to.
+        capture = self._capture_from(packet, arducam.PIX_FMT_JPEG)
+        self._decode(capture)
+        self._score(capture)
+        first = self._preview_frame is None
+        self._preview_frame = capture
+        self.current = capture
+        if first:
+            # Start fitted; after that keep whatever zoom, pan and ruler the
+            # user has set, so they can inspect a detail while it updates.
+            self._fit = True
+            self._centre = (0.5, 0.5)
+            self._ruler = []
+        if capture.sharpness is not None:
+            self._preview_scores.append(capture.sharpness)
+            del self._preview_scores[:-PREVIEW_HISTORY]
+        self._render()
+        self._draw_sharpness()
+        if first:
+            self._set_controls_enabled(self.app.is_connected)
+        self._preview_shown += 1
+        self._preview_shown_at = time.monotonic()
+        self._preview_cost = self._preview_shown_at - started
+
+    def _end_preview(self):
+        """Leave preview mode, keeping the last frame as an ordinary capture."""
+        was_streaming = self._streaming
+        self._streaming = False
+        self._stop_requested_at = 0.0
+        self.parser.watch_stream_off = False
+        if self._preview_timer is not None:
+            try:
+                self.app.root.after_cancel(self._preview_timer)
+            except Exception:
+                pass
+            self._preview_timer = None
+        if self._preview_latest is not None and not self._destroyed:
+            self._show_preview()      # draw the very last frame too
+        last = self._preview_frame
+        self._preview_latest = None
+        self._preview_frame = None
+        self._preview_scores = []
+        self._preview_cost = 0.0
+        self._preview_rx = self._preview_shown = 0
+        if self._destroyed:
+            return
+        try:
+            self.detail_var.set("")
+        except tk.TclError:
+            pass
+        if was_streaming and last is not None:
+            # Only this frame joins the strip: putting every preview frame
+            # there would push the student's stills out within seconds.
+            self.captures.append(last)
+            if len(self.captures) > MAX_CAPTURES:
+                self.captures.pop(0)
+            self.current = last
+            self._draw_strip()
+            self._draw_sharpness()
+            self._set_controls_enabled(self.app.is_connected)
+            if self.autosave_var.get():
+                self.save_image(auto=True)
+
+    def _update_preview_rate(self):
+        """Once a second, say how many frames are arriving and being shown."""
+        if not self._streaming:
+            return
+        now = time.monotonic()
+        mark_t, mark_rx, mark_shown = self._fps_mark
+        if now - mark_t < 1.0:
+            return
+        if mark_t and self._preview_rx >= mark_rx:
+            span = now - mark_t
+            rx = (self._preview_rx - mark_rx) / span
+            shown = (self._preview_shown - mark_shown) / span
+            self.detail_var.set(f"Preview: {shown:.1f} frames/s shown, "
+                                f"{rx:.1f} received")
+        self._fps_mark = (now, self._preview_rx, self._preview_shown)
 
     def add_capture(self, capture: Capture):
         """Decode, score and show a capture. Public so demo mode can reuse it."""
@@ -564,7 +708,25 @@ class CameraTab:
             self._draw_sharpness()
 
     def _photo_from(self, image) -> Optional[tk.PhotoImage]:
-        """QImage -> tk.PhotoImage, via PNG in memory."""
+        """QImage -> tk.PhotoImage.
+
+        Raw PPM first: Tk reads it with no decompression, which is several
+        times faster than PNG at viewer sizes and matters once preview runs at
+        several frames a second. PNG stays as the fallback.
+        """
+        try:
+            rgb = image.convertToFormat(QImage.Format_RGB888)
+            width, height = rgb.width(), rgb.height()
+            ptr = rgb.constBits()
+            ptr.setsize(rgb.sizeInBytes())
+            raw = bytes(ptr)
+            stride, row = rgb.bytesPerLine(), width * 3
+            if stride != row:          # Qt pads each row to 4 bytes
+                raw = b"".join(raw[y * stride:y * stride + row] for y in range(height))
+            header = b"P6\n%d %d\n255\n" % (width, height)
+            return tk.PhotoImage(data=header + raw, format="ppm")
+        except Exception:
+            pass
         try:
             blob = QByteArray()
             buffer = QBuffer(blob)
@@ -806,7 +968,10 @@ class CameraTab:
             self.sharp_canvas.configure(background=themes.CURRENT["surface"])
         except tk.TclError:
             return
-        scores = [c.sharpness for c in self.captures if c.sharpness is not None]
+        if self._streaming and self._preview_scores:
+            scores = list(self._preview_scores)   # live focus trend
+        else:
+            scores = [c.sharpness for c in self.captures if c.sharpness is not None]
         if not scores:
             return
         best = max(scores)
@@ -926,8 +1091,7 @@ class CameraTab:
 
     def toggle_preview(self):
         if self._streaming:
-            self._queue(arducam.stop_stream(), gap_ms=STREAM_STOP_MS)
-            self.status_var.set("Stopping preview...")
+            self._request_stop()
             return
         if not self._ready("starting preview"):
             return
@@ -941,9 +1105,25 @@ class CameraTab:
             return
         self._streaming = True
         self._last_rx = time.monotonic()
+        self._preview_frame = self._preview_latest = None
+        self._preview_scores = []
+        self._preview_rx = self._preview_shown = 0
+        self._fps_mark = (0.0, 0, 0)
+        self._stop_requested_at = 0.0
+        # Let the parser recognise a stop that lands mid-frame (arducam.py).
+        self.parser.watch_stream_off = True
         self.preview_btn.configure(text="Stop Preview")
-        self.status_var.set("Preview running (about one frame a second).")
+        self.status_var.set("Preview running.")
         self._queue(arducam.set_video_resolution(mode))
+
+    def _request_stop(self):
+        """Ask the MCU to stop streaming. Preview ends when its "streamoff"
+        packet arrives (_on_packet), or after STREAM_STOP_TIMEOUT regardless,
+        so a lost reply can never leave the tab stuck as busy."""
+        self._queue(arducam.stop_stream(), gap_ms=STREAM_STOP_MS)
+        if not self._stop_requested_at:
+            self._stop_requested_at = time.monotonic()
+        self.status_var.set("Stopping preview...")
 
     def cancel_capture(self):
         """Give up on the image, but keep reading it.
@@ -954,7 +1134,7 @@ class CameraTab:
         packet is consumed to its end and discarded.
         """
         if self._streaming:
-            self._queue(arducam.stop_stream(), gap_ms=STREAM_STOP_MS)
+            self._request_stop()
             return
         if not self._busy:
             return
@@ -1006,6 +1186,7 @@ class CameraTab:
             return
         try:
             self._update_progress()
+            self._update_preview_rate()
             self._check_watchdog()
         except tk.TclError:
             return
@@ -1017,7 +1198,11 @@ class CameraTab:
             return
         self._progress_dirty = False
         got, total = self._rx_got, self._rx_total
-        if total > 0 and (self._busy or self._streaming):
+        if total > 0 and self._streaming:
+            # Per-frame bytes and ETA mean little in preview; the frame rate
+            # readout (_update_preview_rate) uses the detail line instead.
+            self.progress.configure(maximum=total, value=got)
+        elif total > 0 and self._busy:
             self.progress.configure(maximum=total, value=got)
             elapsed = max(time.monotonic() - self._capture_started, 0.001)
             rate = got / elapsed if elapsed else 0
@@ -1027,6 +1212,19 @@ class CameraTab:
 
     def _check_watchdog(self):
         """Fail a capture that has stopped arriving rather than hanging."""
+        if (self._streaming and self._stop_requested_at
+                and time.monotonic() - self._stop_requested_at > STREAM_STOP_TIMEOUT):
+            # The MCU never confirmed. Stop listening for preview anyway, and
+            # drop any half-read frame so the next capture starts clean.
+            self.parser.reset()
+            self._end_preview()
+            self._reset_transfer()
+            self.preview_btn.configure(text="Start Preview")
+            self.status_var.set("Preview stopped (the camera did not confirm).")
+            self.app.log_message(
+                "Camera: no 'streamoff' reply to Stop Preview; stopped anyway", "ERROR")
+            self._set_controls_enabled(self.app.is_connected)
+            return
         if not self._busy or self._cancelling:
             return
         now = time.monotonic()
@@ -1301,7 +1499,7 @@ class CameraTab:
         self._draw_sharpness()
 
     def _cancel_timers(self, commands: bool = False):
-        for attr in ("_tick_timer", "_cmd_timer"):
+        for attr in ("_tick_timer", "_cmd_timer", "_preview_timer"):
             timer = getattr(self, attr, None)
             if timer is not None:
                 try:
@@ -1318,6 +1516,7 @@ class CameraTab:
         self._destroyed = True
         self._cancel_timers(commands=True)
         self._photo = None
+        self._preview_latest = self._preview_frame = None
         for capture in self.captures:
             capture.thumb = None
             capture.image = None

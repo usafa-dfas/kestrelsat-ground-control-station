@@ -33,6 +33,33 @@ its limits and the firmware and SDK versions.
 TEST MODE synthesises a resolution-chart frame and feeds it through the real codec and
 parser, so the tab - and the whole lab workflow - can be rehearsed without hardware.
 
+**Preview keeps up with a fast link.** The RP2040 Adalogger's Lab 5 firmware now sends
+over native USB with no per-byte delay, and preview frames arrived faster than the tab
+could decode, score, draw and thumbnail every one on the GUI thread, so the picture fell
+further and further behind. Preview now draws only the newest frame, at most about ten a
+second (slower if drawing takes longer), and skips the rest. Preview frames no longer fill
+the capture strip; the last one joins it when preview stops, so it can still be saved, and
+auto-save writes that one frame instead of every frame. The sharpness bars show the live
+preview readings while it runs. Preview always decodes as JPEG, which is what the firmware
+streams, whatever the still format is set to. Frames reach the viewer as raw PPM instead of
+PNG, about four times cheaper, which also speeds up redraws after zooming and panning.
+
+**Stop Preview no longer leaves the tab stuck.** The firmware sends each preview frame a
+few hundred bytes at a time between command checks, so Stop usually lands mid-frame, and
+`stop_preivew()` sends its end marker and "streamoff" reply where the rest of the image
+should have been. The parser trusted the frame's declared length, read the reply as image
+data, and waited forever for the remainder. That left preview "running" and every later
+Take Picture or Start Preview refused with "wait for the current capture to finish".
+While preview runs, the parser now recognises that sequence inside a frame (it cannot
+occur in JPEG data), drops the partial frame and reads the reply. As a backstop, if no
+reply arrives within 3 seconds of Stop, the tab stops anyway and clears the half-read
+frame.
+
+The reader thread no longer sleeps between reads while the link is busy (a read of 512
+bytes or more), and on Windows asks for a 1 MB driver receive buffer instead of the 4 KB
+default. A 115200 board never fills 512 bytes in one 10 ms poll, so it is read exactly as
+before.
+
 ### Notes
 
 No change to the MCU. The same PlatformIO sketch still works with Arducam's GUI tool, so
