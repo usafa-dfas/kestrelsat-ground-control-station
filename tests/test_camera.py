@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 import kestrelsat.app as sg
-from kestrelsat import arducam, camera as camera_mod
+from kestrelsat import arducam, camera as camera_mod, scaling
 
 failures = []
 
@@ -448,6 +448,109 @@ if dialogs:
     dlg = dialogs[0]
     check(bool(dlg.bind("<Escape>")), "it is bound to Escape, like every other dialog")
     dlg.destroy()
+
+
+print("\n-- deleting from the history --")
+app.notebook.select(cam.frame)
+root.update()
+
+
+def make_capture(tag):
+    """A small decoded capture, told apart by its data."""
+    c = camera_mod.Capture(data=JPEG + tag, pix_fmt=arducam.PIX_FMT_JPEG,
+                           mode=0x03, width=320, height=240)
+    return c
+
+
+def click(x, y):
+    """Feed a click at strip coordinates to the strip handler."""
+    event = type("E", (), {"x": int(x), "y": int(y)})()
+    cam._on_strip_click(event)
+
+
+cam.captures = []
+cam.current = None
+for tag in (b"A", b"B", b"C", b"D"):
+    cam.add_capture(make_capture(tag))
+a, b, c, d = cam.captures
+check(cam.current is d and str(cam.clear_all_btn["state"]) == "normal",
+      "four pictures in the history, the newest shown, Clear all enabled")
+check(cam.strip.find_overlapping(*cam._delete_box(
+    scaling.px(app.ui_scale, 6))),
+      "each thumbnail has an x badge drawn in its corner")
+
+# Clicking a thumbnail body still just shows it.
+size = scaling.px(app.ui_scale, camera_mod.THUMB_PX) + scaling.px(app.ui_scale, 8)
+left = scaling.px(app.ui_scale, 6)
+click(left + 4, scaling.px(app.ui_scale, 6) + size // 2)
+check(cam.current is a and len(cam.captures) == 4,
+      "clicking a thumbnail (not its x) shows it and deletes nothing")
+
+# Deleting one that is not on screen leaves the viewer alone.
+fake_mb.clear()
+bx0, by0, bx1, by1 = cam._delete_box(left + 2 * size)
+click((bx0 + bx1) / 2, (by0 + by1) / 2)
+check(cam.captures == [a, b, d] and cam.current is a,
+      "the x on another picture removes just that one; the view is unchanged")
+check(fake_mb.calls == [], "and asks nothing")
+
+# Deleting the one on screen shows its neighbour.
+cam.delete_capture(a)
+check(cam.captures == [b, d] and cam.current is b,
+      "deleting the picture on screen shows the next one along")
+cam.delete_capture(d)
+check(cam.current is b, "deleting the newest while it is not shown changes nothing else")
+cam._show_capture(b)
+
+# Saved files stay on disk.
+tmp = tempfile.mkdtemp()
+try:
+    saved = os.path.join(tmp, "kept.jpg")
+    with open(saved, "wb") as handle:
+        handle.write(JPEG)
+    b.saved_path = saved
+    cam.delete_capture(b)
+    check(os.path.exists(saved), "a deleted picture's saved file is left on disk")
+    check("still on disk" in cam.status_var.get(), "and the status line says so")
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+check(cam.captures == [] and cam.current is None,
+      "deleting the last picture empties the viewer")
+check(str(cam.save_btn["state"]) == "disabled"
+      and str(cam.clear_all_btn["state"]) == "disabled",
+      "with Save and Clear all disabled, as there is nothing to act on")
+
+# Clear all asks first, and No keeps everything.
+for tag in (b"E", b"F", b"G"):
+    cam.add_capture(make_capture(tag))
+kept = list(cam.captures)
+fake_mb.clear()
+fake_mb.answer = False
+cam.clear_history()
+check([n for n, _, _ in fake_mb.calls] == ["askyesno"],
+      "Clear all asks for confirmation")
+check("not deleted" in fake_mb.calls[0][2],
+      "and the question says saved files are not deleted")
+check(cam.captures == kept, "answering No keeps every picture")
+fake_mb.answer = True
+cam.clear_history()
+check(cam.captures == [] and cam.current is None,
+      "answering Yes empties the history and the viewer")
+fake_mb.clear()
+cam.clear_history()
+check(fake_mb.calls == [], "Clear all on an empty history does not ask")
+
+# During preview the viewer shows the live frame, which is not in the history.
+cam.add_capture(make_capture(b"H"))
+live = make_capture(b"live")
+cam._streaming = True
+cam.current = live
+cam.clear_history()
+check(cam.captures == [] and cam.current is live,
+      "clearing during preview leaves the live frame on screen")
+cam._streaming = False
+cam.current = None
+root.update()
 
 
 print("\n-- teardown --")

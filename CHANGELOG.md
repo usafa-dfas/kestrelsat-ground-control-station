@@ -44,6 +44,12 @@ preview readings while it runs. Preview always decodes as JPEG, which is what th
 streams, whatever the still format is set to. Frames reach the viewer as raw PPM instead of
 PNG, about four times cheaper, which also speeds up redraws after zooming and panning.
 
+**Delete pictures from the history strip.** Each thumbnail has a small x in its corner that
+removes it at once, and a Clear all button removes the lot after a confirmation. Deleting
+only drops the in-memory copy: files already saved to disk are never touched, so a stray
+click cannot destroy a lab record. If the picture on screen is deleted, the viewer moves to
+the next one along, or empties if none are left; a live preview frame is left alone.
+
 **Stop Preview no longer leaves the tab stuck.** The firmware sends each preview frame a
 few hundred bytes at a time between command checks, so Stop usually lands mid-frame, and
 `stop_preivew()` sends its end marker and "streamoff" reply where the rest of the image

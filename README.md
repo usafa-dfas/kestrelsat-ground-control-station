@@ -142,6 +142,12 @@ second), so the picture never lags behind the camera. Zoom, pan and the ruler st
 it updates, and the sharpness bars show the last few seconds of frames, so you can turn the
 lens and watch the bars climb. Only the last frame is kept in the strip when preview stops.
 
+**The history strip** below the viewer holds the session's last 20 pictures; click one to
+view it. The small **x** in a thumbnail's corner removes that picture straight away, and
+**Clear all** removes every one after asking first. Both only remove pictures from the
+strip: anything already saved to disk (by "Save Image..." or auto-save) stays where it is.
+If the picture on screen is removed, the viewer moves to the next one along.
+
 **Looking at the image.** "Fit" shows the whole frame; "1:1" shows one image pixel per
 screen pixel, and `-`/`+` or the mouse wheel step the zoom. Drag to pan. Click two points
 to measure the distance between them **in image pixels**, which is how you read off the
