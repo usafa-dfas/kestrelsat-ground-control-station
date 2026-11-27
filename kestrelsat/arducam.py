@@ -160,8 +160,9 @@ TRAILER_SCAN = 64
 # bytes - but raw RGB565/YUV can hold anything, hence the opt-in flag.
 STREAM_OFF_SIGNATURE = b"\xff\xbb\xff\xaa\x06"
 
-# Bytes per second on the wire: 115200 8N1 is 10 bits/byte, and the firmware's
-# arducamUartWrite adds delayUs(12) on top of every one of them.
+# Bytes per second on the ESP32 Thing Plus's UART link: 115200 8N1 is 10
+# bits/byte, and the firmware's arducamUartWrite adds delayUs(12) on top of
+# every one of them. (The RP2040 Adalogger's native USB is far faster.)
 BYTES_PER_SECOND_115200 = int(1.0 / (10.0 / 115200.0 + 12e-6))
 
 

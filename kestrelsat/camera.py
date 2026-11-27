@@ -43,6 +43,11 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional, Tuple
 
+try:
+    from serial.tools import list_ports
+except ImportError:  # pragma: no cover
+    list_ports = None
+
 from . import arducam, scaling, themes
 from .widgets import ScrollableFrame, ToolTip
 
@@ -62,7 +67,14 @@ except ImportError:  # pragma: no cover
     NUMPY_AVAILABLE = False
 
 
-CAMERA_BAUD = 115200          # the firmware hard-codes this
+# The ESP32 Thing Plus firmware talks to the PC through a USB-serial bridge
+# chip at a fixed 115200 baud, so there the Connection tab must match. The
+# RP2040 Adalogger uses the chip's own (native) USB, which ignores the baud
+# setting entirely - any value works.
+CAMERA_BAUD = 115200
+# USB vendor IDs of boards whose port is native USB (baud does not matter):
+# Adafruit (the Feather RP2040 Adalogger) and Raspberry Pi (other RP2040s).
+NATIVE_USB_VIDS = (0x239A, 0x2E8A)
 COMMAND_GAP_MS = 25           # the MCU flushes anything arriving in one burst
 RESOLUTION_SETTLE_MS = 500    # set-resolution also fires an untransmitted shot
 STREAM_STOP_MS = 300
@@ -198,9 +210,13 @@ class CameraTab:
         # 1. Connection banner.
         self.banner = ttk.Frame(self.frame)
         self.banner.pack(side=tk.TOP, fill=tk.X, padx=px(6), pady=(px(4), 0))
+        # Wrap the text to whatever width the tab has, so a long message
+        # never forces the whole window to be wider than the user made it.
         self.banner_label = ttk.Label(self.banner, textvariable=self.banner_var,
-                                      anchor=tk.W)
+                                      anchor=tk.W, wraplength=px(300))
         self.banner_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.banner.bind("<Configure>", lambda e: self.banner_label.configure(
+            wraplength=max(px(100), e.width)))
 
         # 2. Progress and status.
         status_row = ttk.Frame(self.frame)
@@ -292,10 +308,12 @@ class CameraTab:
         self.preview_btn.pack(fill=tk.X, pady=(px(2), 0))
         ToolTip(self.preview_btn,
                 "Preview streams JPEG frames continuously for framing and "
-                "focus. On the Thing Plus (115200 link) that is about one frame "
-                "a second; on the RP2040 Adalogger it is several. The newest "
-                "frame is always shown, and frames that arrive faster than "
-                "they can be drawn are skipped.")
+                "focus. On the RP2040 Adalogger that is several frames a "
+                "second at 640x480 and about one a second at full resolution. "
+                "On the ESP32 Thing Plus (115200 link) it is about one a "
+                "second at 320x240, so keep it small there. The newest frame "
+                "is always shown, and frames that arrive faster than they can "
+                "be drawn are skipped.")
         self.info_btn = ttk.Button(cap, text="Camera Info", command=self.show_info)
         self.info_btn.pack(fill=tk.X, pady=(px(2), 0))
 
@@ -358,7 +376,8 @@ class CameraTab:
         app = self.app
         if not app.is_connected:
             text = ("Not connected. Open the Connection tab, pick the MCU's port "
-                    f"and connect at {CAMERA_BAUD} baud.")
+                    "and connect. Any baud rate works on the RP2040 Adalogger; "
+                    f"the ESP32 Thing Plus needs {CAMERA_BAUD}.")
         elif app.test_mode:
             text = ("TEST MODE: captures are generated locally so the tab can be "
                     "used without hardware.")
@@ -367,9 +386,11 @@ class CameraTab:
                 baud = int(app.baud_var.get())
             except (ValueError, AttributeError):
                 baud = None
-            if baud != CAMERA_BAUD:
-                text = (f"Connected at {baud} baud. The ArduCAM firmware runs at "
-                        f"{CAMERA_BAUD}; change it on the Connection tab.")
+            if baud != CAMERA_BAUD and not self._native_usb():
+                text = (f"Connected at {baud} baud. If this is the ESP32 Thing "
+                        f"Plus, its camera firmware runs at {CAMERA_BAUD}; change "
+                        "it on the Connection tab. (The RP2040 Adalogger "
+                        "ignores the baud rate.)")
             else:
                 text = ""
         self.banner_var.set(text)
@@ -378,6 +399,21 @@ class CameraTab:
             self.banner_label.configure(foreground=colour)
         except tk.TclError:
             pass
+
+    def _native_usb(self) -> bool:
+        """True if the open port is a native-USB board (the RP2040), where the
+        baud rate is ignored. False if it is anything else or cannot be told,
+        so an unknown board still gets the baud warning."""
+        if list_ports is None:
+            return False
+        try:
+            port = self.app.port_var.get()
+            for info in list_ports.comports():
+                if info.device == port:
+                    return info.vid in NATIVE_USB_VIDS
+        except Exception:
+            pass
+        return False
 
     def on_connect(self):
         self.parser.reset()
@@ -1148,10 +1184,13 @@ class CameraTab:
         if raw:
             secs = arducam.estimate_seconds(raw)
             text = (f"{arducam.PIX_FMT_NAMES[pix_fmt]} at {arducam.mode_label(mode)} "
-                    f"is {raw / 1e6:.1f} MB - about {secs / 60:.0f} min at 115200. "
-                    "JPEG is far quicker.")
+                    f"is {raw / 1e6:.1f} MB - about {secs / 60:.0f} min on the "
+                    "ESP32 Thing Plus (115200), much less on the RP2040 "
+                    "Adalogger. JPEG is far quicker.")
         else:
-            text = "JPEG size varies; a full-resolution frame takes roughly 30-50 s."
+            text = ("JPEG size varies. A full-resolution frame takes a couple "
+                    "of seconds or less on the RP2040 Adalogger, and roughly "
+                    "30-50 s on the ESP32 Thing Plus (115200).")
         try:
             self.estimate_label.configure(text=text)
         except tk.TclError:
@@ -1196,13 +1235,6 @@ class CameraTab:
         if not self._ready("starting preview"):
             return
         mode = self._selected_mode()
-        width, _ = arducam.size_for_mode(mode)
-        if width > 640 and not messagebox.askyesno(
-                "Preview resolution",
-                f"Preview at {arducam.mode_label(mode)} sends a frame every "
-                "several seconds over a 115200 link.\n\n"
-                "320x240 or 640x480 is far more usable. Start anyway?"):
-            return
         self._streaming = True
         self._last_rx = time.monotonic()
         self._preview_frame = self._preview_latest = None
@@ -1330,9 +1362,9 @@ class CameraTab:
         now = time.monotonic()
         if self._rx_total == 0:
             if self._await_since and now - self._await_since > FIRST_BYTE_TIMEOUT:
-                self._fail("No response from the camera. Check the port is at "
-                           f"{CAMERA_BAUD} baud, the wiring, and that the blue "
-                           "STAT LED is lit.")
+                self._fail("No response from the camera. Check the wiring, "
+                           "that the blue STAT LED is lit, and on the ESP32 "
+                           f"Thing Plus that the port is at {CAMERA_BAUD} baud.")
         elif now - self._last_rx > STALL_TIMEOUT:
             self._fail(f"Transfer stalled at {self._rx_got:,} of "
                        f"{self._rx_total:,} bytes.")
@@ -1542,8 +1574,9 @@ class CameraTab:
                 ("SDK", self.info.get("sdk", "not reported")),
             ]
         else:
-            rows = [("Status", "The camera has not reported yet. Connect at "
-                               f"{CAMERA_BAUD} baud and press Camera Info again.")]
+            rows = [("Status", "The camera has not reported yet. Connect (at "
+                               f"{CAMERA_BAUD} baud for the ESP32 Thing Plus) "
+                               "and press Camera Info again.")]
 
         for label, value in rows:
             row = ttk.Frame(body)
