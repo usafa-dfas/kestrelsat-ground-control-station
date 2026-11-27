@@ -66,12 +66,21 @@ bytes or more), and on Windows asks for a 1 MB driver receive buffer instead of 
 default. A 115200 board never fills 512 bytes in one 10 ms poll, so it is read exactly as
 before.
 
+**Camera tab notes match the RP2040.** The banner, capture-time estimate, Preview tooltip,
+error messages and README no longer assume a 115200 link. They now say that the RP2040
+Adalogger's native USB ignores the baud rate and takes a couple of seconds or less for a
+full-resolution JPEG, while the ESP32 Thing Plus still needs 115200 and still takes 30-50
+seconds. The "connected at the wrong baud" warning is skipped when the port is a native-USB
+board (Adafruit or Raspberry Pi USB vendor ID). The "Preview resolution" question before a
+preview larger than 640x480 is gone; full-resolution preview runs at about one frame a
+second on the RP2040.
+
 ### Notes
 
 No change to the MCU. The same PlatformIO sketch still works with Arducam's GUI tool, so
-Task 2 of the lab handout stands as written. At 115200 the firmware's UART write adds
-12 us per byte, giving about 10 kB/s, so a full-resolution JPEG takes 30-50 seconds and
-preview runs near one frame a second. The README documents an optional firmware patch for
+Task 2 of the lab handout stands as written. On the ESP32 Thing Plus, at 115200 the
+firmware's UART write adds 12 us per byte, giving about 10 kB/s, so a full-resolution JPEG
+takes 30-50 seconds and preview runs near one frame a second. The README documents an optional firmware patch for
 instructors who want that faster.
 
 The camera parser runs inside the existing receive pump and hands back whatever was not

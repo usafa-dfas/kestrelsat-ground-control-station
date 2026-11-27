@@ -108,6 +108,32 @@ check(cam.banner_var.get().startswith("Not connected"),
       "the banner says so plainly")
 check(not cam.busy, "an idle tab is not busy")
 
+# Baud only matters on a USB-serial bridge (ESP32 Thing Plus). The RP2040
+# Adalogger's native USB ignores it, so the banner must not nag there.
+from types import SimpleNamespace
+real_list_ports = camera_mod.list_ports
+real_port, real_baud = app.port_var.get(), app.baud_var.get()
+def fake_ports(vid):
+    return SimpleNamespace(comports=lambda: [SimpleNamespace(device="COM9", vid=vid)])
+app.port_var.set("COM9")
+app.baud_var.set("9600")
+app.is_connected, app.test_mode = True, False
+camera_mod.list_ports = fake_ports(0x239A)      # Adafruit Feather RP2040
+cam.update_banner()
+check(cam.banner_var.get() == "", "no baud warning on the RP2040's native USB")
+camera_mod.list_ports = fake_ports(0x1A86)      # CH340 USB-serial bridge
+cam.update_banner()
+check("115200" in cam.banner_var.get(),
+      "a bridged board at 9600 is told the camera wants 115200")
+app.baud_var.set("115200")
+cam.update_banner()
+check(cam.banner_var.get() == "", "and 115200 on a bridge is fine")
+camera_mod.list_ports = real_list_ports
+app.port_var.set(real_port)
+app.baud_var.set(real_baud)
+app.is_connected = False
+cam.update_banner()
+
 
 print("\n-- the demux contract --")
 JPEG = None
@@ -238,21 +264,22 @@ check(sent.index(arducam.set_picture_resolution(
           arducam.PIX_FMT_JPEG, arducam.MODE_QXGA)) < sent.index(arducam.take_picture()),
       "resolution is set before the shot is taken")
 
-# Preview above 640px wide asks first: a full-resolution preview would send
-# one frame every several seconds. Declining must not start it.
+# Preview at full resolution starts straight away: there is no "this will be
+# slow" question any more (the RP2040 previews 2048x1536 at about 1 fps).
 sent.clear()
 cam._reset_transfer()
 cam._cancelling = False
 fake_mb.clear()
-fake_mb.answer = False
 cam.mode_var.set("2048x1536")
 cam.toggle_preview()
 pump(4)
-check(any(k == "askyesno" for k, _, _ in fake_mb.calls) and not cam._streaming,
-      "a full-resolution preview asks first, and declining does not start it")
-check(arducam.set_video_resolution(arducam.MODE_QXGA) not in sent,
-      "and nothing is sent")
-fake_mb.answer = True
+check(not fake_mb.calls and cam._streaming,
+      "a full-resolution preview starts without asking")
+check(arducam.set_video_resolution(arducam.MODE_QXGA) in sent,
+      "and sends the full-resolution video command")
+cam._end_preview()
+cam._reset_transfer()
+cam.preview_btn.configure(text="Start Preview")
 
 sent.clear()
 cam.mode_var.set("320x240")

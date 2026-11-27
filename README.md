@@ -121,22 +121,27 @@ Drives an ArduCAM Mega SPI camera attached to the MCU, over the same serial link
 everything else. It speaks the stock Arducam protocol, so **no change to the MCU firmware
 is needed** and the same board still works with Arducam's own GUI tool.
 
-The firmware runs the link at **115200 baud** - connect at that rate on the Connection tab
-or the camera will not answer. The tab says so in a banner if the port is closed or the
-baud looks wrong.
+**Baud rate.** On the **RP2040 Adalogger** the board talks over its own (native) USB, so
+the baud setting on the Connection tab is ignored and any value works. On the **ESP32
+Thing Plus** the link goes through a USB-serial bridge chip at a fixed **115200 baud** -
+connect at that rate or the camera will not answer. The tab shows a banner if the port is
+closed, or if a board that is not native USB is connected at some other rate.
 
 **Taking a picture.** Pick the format (JPEG unless you have a reason), the size and the
 quality, then "Take Picture". The progress bar shows bytes received, rate and an estimate
-of the time left; "Cancel" abandons the image. A full-resolution 2048x1536 JPEG takes
-**30-50 seconds** - see [Why captures are slow](#why-captures-are-slow) below.
+of the time left; "Cancel" abandons the image. A full-resolution 2048x1536 JPEG takes **a
+couple of seconds or less** on the RP2040 Adalogger, and **30-50 seconds** on the ESP32
+Thing Plus - see [Why captures are slow on the Thing Plus](#why-captures-are-slow-on-the-thing-plus)
+below.
 
 The size list is built from the module's own reported capabilities, so a 3MP camera is
 never offered a resolution it cannot produce. "Camera Info" shows the module, its exposure
 and gain limits, and the firmware and SDK versions.
 
-**Preview** streams frames continuously for framing and focus. On the Thing Plus (115200)
-that is roughly one frame a second; on the RP2040 Adalogger, whose Lab 5 firmware sends over
-native USB, it is several. Either way keep it at 320x240 or 640x480. The viewer always shows
+**Preview** streams frames continuously for framing and focus, at whatever size is picked.
+On the RP2040 Adalogger, whose Lab 5 firmware sends over native USB, that is several frames
+a second at 640x480 and still about one a second at full resolution. On the Thing Plus
+(115200) it is roughly one frame a second at 320x240, so keep it small there. The viewer always shows
 the newest frame and skips any that arrive faster than it can draw them (at most about ten a
 second), so the picture never lags behind the camera. Zoom, pan and the ruler stay put while
 it updates, and the sharpness bars show the last few seconds of frames, so you can turn the
@@ -168,9 +173,10 @@ asking.
 **Without hardware**, connect to `TEST MODE`: the tab synthesises a resolution-chart frame
 and feeds it through the real protocol parser, so the whole workflow can be rehearsed.
 
-#### Why captures are slow
+#### Why captures are slow on the Thing Plus
 
-The Arducam library's UART write adds a 12 microsecond delay to every byte on top of the
+This applies to the ESP32 Thing Plus only; the RP2040 Adalogger's native USB has no such
+limit. The Arducam library's UART write adds a 12 microsecond delay to every byte on top of the
 115200 bit time, which works out at about 10 kB/s. That is what makes a full-resolution
 JPEG take 30-50 seconds and holds preview near one frame a second.
 
@@ -296,17 +302,19 @@ not match `kestrelsat.__version__`.
    partial fragment left in the device's buffer.
 6. **"PyQtGraph not available"**: Install the plotting dependencies with
    `pip install pyqtgraph PyQt5`
-7. **Camera does not answer**: The ArduCAM firmware is fixed at 115200 baud, so connect at
-   that rate. Check that the blue STAT LED near the centre of the MCU board is lit, which
+7. **Camera does not answer**: On the ESP32 Thing Plus the camera firmware is fixed at
+   115200 baud, so connect at that rate (the RP2040 Adalogger ignores baud). Check that the blue STAT LED near the centre of the MCU board is lit, which
    means the camera initialised over SPI, and that the camera has power - it draws more
    than some USB ports will supply, which is why the lab powers the 5V rail from the
    battery.
-8. **A capture takes half a minute**: That is expected at full resolution. See
-   [Why captures are slow](#why-captures-are-slow).
+8. **A capture takes half a minute**: That is expected at full resolution on the ESP32
+   Thing Plus. See [Why captures are slow on the Thing Plus](#why-captures-are-slow-on-the-thing-plus).
+   On the RP2040 Adalogger a full-resolution JPEG takes a couple of seconds or less.
 9. **Preview is not smooth**: Expected on the Thing Plus - roughly one frame a second at
-   115200. Use it for framing and coarse focus, not as video.
+   115200 - and at full resolution on the RP2040 Adalogger (about one a second). Drop to
+   640x480 or smaller for a faster preview. Use it for framing and coarse focus, not as video.
 10. **"image arrived without its end marker"**: The image is shown anyway but may be
-    truncated. Usually a baud-rate or cabling problem; retake it.
+    truncated. Usually a cabling problem (or, on the Thing Plus, the baud rate); retake it.
 
 ### Error Messages
 
