@@ -72,6 +72,7 @@ FIRST_BYTE_TIMEOUT = 8.0      # seconds to wait for any response at all
 STALL_TIMEOUT = 5.0           # seconds without progress mid-image
 MAX_CAPTURES = 20             # thumbnails kept in the session strip
 THUMB_PX = 64
+DELETE_PX = 16                # the "x" badge in each thumbnail's corner
 FOCUS_ROI = 512               # sharpness is always measured over this many
                               # native pixels, so readings stay comparable
 ZOOM_STEPS = (0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
@@ -213,10 +214,20 @@ class CameraTab:
         self.progress.pack(side=tk.RIGHT, padx=px(8))
         ttk.Label(status_row, textvariable=self.detail_var).pack(side=tk.RIGHT)
 
-        # 3. Capture strip.
-        self.strip = tk.Canvas(self.frame, height=px(THUMB_PX + 16),
+        # 3. Capture strip, with "Clear all" at its right-hand end.
+        self.strip_row = ttk.Frame(self.frame)
+        self.strip_row.pack(side=tk.BOTTOM, fill=tk.X, padx=px(6), pady=(0, px(2)))
+        self.clear_all_btn = ttk.Button(self.strip_row, text="Clear all",
+                                        command=self.clear_history,
+                                        state=tk.DISABLED)
+        self.clear_all_btn.pack(side=tk.RIGHT, anchor=tk.N, padx=(px(6), 0),
+                                pady=px(6))
+        ToolTip(self.clear_all_btn,
+                "Remove every picture from this history (asks first). "
+                "Files already saved to disk are kept.")
+        self.strip = tk.Canvas(self.strip_row, height=px(THUMB_PX + 16),
                                highlightthickness=0, takefocus=0)
-        self.strip.pack(side=tk.BOTTOM, fill=tk.X, padx=px(6), pady=(0, px(2)))
+        self.strip.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.strip.bind("<Button-1>", self._on_strip_click)
 
         # 4. Control panel.
@@ -939,18 +950,107 @@ class CameraTab:
             if capture is self.current:
                 self.strip.create_rectangle(x - 2, px(4), x + size + 2, px(8) + size,
                                             outline=themes.CURRENT["accent"], width=2)
+            # The delete badge: a small box with an "x" in the top-right corner.
+            bx0, by0, bx1, by1 = self._delete_box(x)
+            self.strip.create_rectangle(bx0, by0, bx1, by1,
+                                        fill=themes.CURRENT["surface"],
+                                        outline=themes.CURRENT["border"])
+            self.strip.create_text((bx0 + bx1) / 2, (by0 + by1) / 2, text="\u00d7",
+                                   fill=themes.CURRENT["fg"])
         self.strip.configure(scrollregion=self.strip.bbox("all"))
+        try:
+            self.clear_all_btn.configure(
+                state=tk.NORMAL if self.captures else tk.DISABLED)
+        except tk.TclError:
+            pass
+
+    def _delete_box(self, x: int) -> Tuple[int, int, int, int]:
+        """Corners of the "x" badge on the thumbnail whose left edge is x."""
+        px = lambda n: scaling.px(self.app.ui_scale, n)
+        right = x + px(THUMB_PX)
+        top = px(6)
+        return right - px(DELETE_PX), top, right, top + px(DELETE_PX)
 
     def _on_strip_click(self, event):
         px = lambda n: scaling.px(self.app.ui_scale, n)
         size = px(THUMB_PX) + px(8)
-        index = max(0, (event.x - px(6)) // size)
-        if index < len(self.captures):
-            self.current = self.captures[int(index)]
-            self._fit = True
-            self._ruler = []
-            self.readout_var.set("")
-            self._render()
+        index = int(max(0, (event.x - px(6)) // size))
+        if index >= len(self.captures):
+            return
+        # A click on the thumbnail's "x" badge deletes it; anywhere else shows it.
+        bx0, by0, bx1, by1 = self._delete_box(px(6) + index * size)
+        if bx0 <= event.x <= bx1 and by0 <= event.y <= by1:
+            self.delete_capture(self.captures[index])
+            return
+        self._show_capture(self.captures[index])
+
+    def _show_capture(self, capture: Optional[Capture]):
+        """Put a capture (or nothing) in the viewer, fitted, with no ruler."""
+        self.current = capture
+        self._fit = True
+        self._centre = (0.5, 0.5)
+        self._ruler = []
+        self.readout_var.set("")
+        self._render()
+        self._draw_strip()
+        self._draw_sharpness()
+        try:            # Save needs something on screen to save
+            self.save_btn.configure(
+                state=tk.NORMAL if capture is not None else tk.DISABLED)
+        except tk.TclError:
+            pass
+
+    def delete_capture(self, capture: Capture):
+        """Remove one picture from the history. No confirmation: it is one click.
+
+        Only the in-memory copy goes. A file the picture was saved to stays on
+        disk - that file is the student's lab record, and an "x" that deleted
+        it without asking would be too easy to hit by accident.
+        """
+        if capture not in self.captures:
+            return
+        index = self.captures.index(capture)
+        self.captures.pop(index)
+        capture.thumb = None
+        if capture.saved_path:
+            self.status_var.set(f"Removed from history; "
+                                f"{os.path.basename(capture.saved_path)} is still on disk.")
+        else:
+            self.status_var.set("Removed from history.")
+        if capture is self.current:
+            # Show the picture that slid into its place (the next newer one),
+            # or the one before it if it was the newest, or nothing if empty.
+            if self.captures:
+                self._show_capture(self.captures[min(index, len(self.captures) - 1)])
+            else:
+                self._show_capture(None)
+        else:
+            self._draw_strip()
+            self._draw_sharpness()
+        capture.image = None
+
+    def clear_history(self):
+        """Remove every picture from the history, after asking."""
+        if not self.captures:
+            return
+        count = len(self.captures)
+        noun = "picture" if count == 1 else "pictures"
+        if not messagebox.askyesno(
+                "Clear all pictures",
+                f"Remove all {count} {noun} from the history?\n\n"
+                "Pictures you have not saved will be lost. Files already "
+                "saved to disk are not deleted."):
+            return
+        shown_was_history = self.current in self.captures
+        for capture in self.captures:
+            capture.thumb = None
+            capture.image = None
+        self.captures = []
+        self.status_var.set("History cleared. Saved files are still on disk.")
+        if shown_was_history:
+            self._show_capture(None)
+        else:
+            # The viewer is showing a live preview frame: leave it alone.
             self._draw_strip()
             self._draw_sharpness()
 
